@@ -1,0 +1,35 @@
+[project]
+name = "claude-scope-tracker"
+version = "0.1.0"
+description = "Learn token costs from your Claude Code sessions and warn before tasks blow up mid-execution."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "your name" }]
+keywords = ["claude", "claude-code", "tokens", "hooks", "estimation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "scikit-learn>=1.3",
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourname/claude-scope-tracker"
+Issues = "https://github.com/yourname/claude-scope-tracker/issues"
+
+[project.scripts]
+scope-tracker = "scope_tracker.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scope_tracker"]
