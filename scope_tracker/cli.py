@@ -16,7 +16,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import core, hooks
+from .. import core, hooks
 
 DEFAULT_SETTINGS = Path.home() / ".claude" / "settings.json"
 HOOK_TAG = "scope_tracker"  # used to identify our hooks in settings

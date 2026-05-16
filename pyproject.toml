@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourname/claude-scope-tracker"
-Issues = "https://github.com/yourname/claude-scope-tracker/issues"
+Homepage = "https://github.com/marustas/Claude-Code-Scope-Tracker"
+Issues = "https://github.com/marustas/Claude-Code-Scope-Tracker"
 
 [project.scripts]
 scope-tracker = "scope_tracker.cli:main"

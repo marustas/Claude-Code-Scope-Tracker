@@ -12,7 +12,7 @@ import json
 import sys
 import time
 
-from . import core
+from .. import core
 
 
 def _read_stdin_json() -> dict:
