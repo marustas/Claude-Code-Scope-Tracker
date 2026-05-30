@@ -81,9 +81,9 @@ The warning text goes into Claude's context as a notice for the user — Claude 
 
 ## roadmap (maybe)
 
-- Prediction intervals, not point estimates
-- Per-repo personalization (hierarchical model)
-- Mid-task budget tracking — warn when consumption crosses % of predicted
+- ~~Prediction intervals, not point estimates~~ — done: models are log-space quantile (p50/p90)
+- ~~Mid-task budget tracking — warn when consumption crosses % of predicted~~ — done: the PostToolUse hook re-projects the final total from cost-so-far once a task passes 3 tool calls (far more accurate than the prompt-only estimate)
+- Per-repo personalization (hierarchical model) — *measured low value: repo identity explained only ~6% of cost variance in testing*
 - Pre-`PreCompact` warning hook
 - Cross-session learning across teams (opt-in, anonymized)
 - A "scope down" agent that auto-proposes smaller versions of big tasks
