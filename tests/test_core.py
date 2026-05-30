@@ -127,5 +127,33 @@ class TestLogSpaceQuantileModel(unittest.TestCase):
         self.assertGreaterEqual(out["predicted_p90"], out["predicted_tokens"])
 
 
+class TestMidTaskModel(unittest.TestCase):
+    def test_midtask_vector_length(self):
+        pf = core.extract_prompt_features("implement a thing")
+        rf = {"file_count": 100}
+        vec = core.midtask_vector(pf, rf, tools_so_far=4, tokens_so_far=12000)
+        self.assertEqual(len(vec), len(core.MIDTASK_FEATURE_NAMES))
+        # appended features: tool count raw, tokens in log space
+        self.assertEqual(vec[-2], 4.0)
+        self.assertAlmostEqual(vec[-1], math.log1p(12000))
+
+    def test_predict_midtask_floors_at_spent_and_clamps_p90(self):
+        from unittest import mock
+        # Raw models project LOW (log ~9 ≈ 8k) and crossed (p90<p50), but the task
+        # has already burned 40k — the projection must never dip below that.
+        crossing = {0.5: _ConstModel(9.0), 0.9: _ConstModel(8.0)}
+        with mock.patch.object(core, "load_midtask_model", return_value=crossing):
+            out = core.predict_midtask({"verb_tier": 2}, {"file_count": 100},
+                                       tools_so_far=5, tokens_so_far=40000)
+        self.assertIsNotNone(out)
+        self.assertGreaterEqual(out["predicted_tokens"], 40000)  # floored at spent
+        self.assertGreaterEqual(out["predicted_p90"], out["predicted_tokens"])
+
+    def test_predict_midtask_none_without_model(self):
+        from unittest import mock
+        with mock.patch.object(core, "load_midtask_model", return_value=None):
+            self.assertIsNone(core.predict_midtask({}, {}, 5, 1000))
+
+
 if __name__ == "__main__":
     unittest.main()
