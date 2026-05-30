@@ -35,10 +35,11 @@ def _next_task_id(conn, session_id: str) -> str:
     return f"{session_id}:{next_turn}"
 
 
-def _format_warning(predicted: int, stats: dict) -> str:
+def _format_warning(predicted: int, predicted_p90: int, stats: dict) -> str:
     return (
         f"[scope-tracker — notice for the user]: based on {stats['n']} of your past "
-        f"Claude Code tasks, this one is estimated at ~{predicted:,} tokens "
+        f"Claude Code tasks, this one is estimated at ~{predicted:,} tokens, and could "
+        f"reach ~{predicted_p90:,} (90th percentile) "
         f"(your historical mean is {stats['mean']:,}, max {stats['max']:,}). "
         f"This is in the upper range of your usage and tasks like this sometimes hit "
         f"context limits mid-execution. You may want to scope this down or split it "
@@ -64,15 +65,16 @@ def on_prompt_submit() -> int:
 
     pred = core.predict(prompt, cwd)
     predicted_tokens = pred["predicted_tokens"] if pred else None
+    predicted_p90 = pred["predicted_p90"] if pred else None
 
     conn = core.db()
     task_id = _next_task_id(conn, session_id)
     conn.execute(
         """INSERT INTO tasks (
                task_id, session_id, started_at, cwd, prompt,
-               prompt_features, repo_features, predicted_tokens,
+               prompt_features, repo_features, predicted_tokens, predicted_p90,
                transcript_start_line, transcript_path
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task_id,
             session_id,
@@ -82,6 +84,7 @@ def on_prompt_submit() -> int:
             json.dumps(pf),
             json.dumps(rf),
             predicted_tokens,
+            predicted_p90,
             core.count_lines(transcript_path),
             transcript_path,
         ),
@@ -89,13 +92,14 @@ def on_prompt_submit() -> int:
     conn.commit()
     conn.close()
 
-    # Only surface a warning when we actually have a trained model AND prediction
-    # is meaningfully high. Stay silent otherwise.
+    # Only surface a warning when we actually have a trained model AND the upper
+    # bound (p90) is meaningfully high. Warning on p90 rather than the point
+    # estimate matches the tool's job: avoid blowing the context limit mid-task.
     if pred and pred["stats"]["n"] >= core.MIN_TASKS_FOR_PREDICTION:
         threshold = max(core.WARN_ABSOLUTE_FLOOR,
                         int(pred["stats"]["mean"] * core.WARN_MULTIPLIER))
-        if predicted_tokens and predicted_tokens > threshold:
-            print(_format_warning(predicted_tokens, pred["stats"]))
+        if predicted_p90 and predicted_p90 > threshold:
+            print(_format_warning(predicted_tokens, predicted_p90, pred["stats"]))
 
     return 0
 

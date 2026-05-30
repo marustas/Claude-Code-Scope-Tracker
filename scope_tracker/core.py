@@ -7,6 +7,7 @@ If not, no amount of fancy fixes it.
 from __future__ import annotations
 
 import json
+import math
 import os
 import pickle
 import re
@@ -61,7 +62,17 @@ def db() -> sqlite3.Connection:
     ensure_dirs()
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent column additions. CREATE TABLE IF NOT EXISTS won't add columns
+    to a table that already exists, so new columns are added here."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "predicted_p90" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN predicted_p90 INTEGER")
+        conn.commit()
 
 
 # --- Feature extraction ---
@@ -81,19 +92,79 @@ _VERB_TIERS = {
     ],
 }
 
+# Irregular forms our suffix rules can't derive. Keyed by base verb.
+_IRREGULAR = {
+    "build": ("built",),
+    "rewrite": ("rewrote", "rewritten"),
+    "write": ("wrote", "written"),
+    "find": ("found",),
+}
 
-def _has_word(text: str, word: str) -> bool:
-    return bool(re.search(rf"\b{re.escape(word)}\b", text, flags=re.IGNORECASE))
+
+def _inflections(verb: str) -> set[str]:
+    """Lightweight inflection generation (no NLP dependency).
+
+    Covers the regular cases the verb lists actually need: -s/-ed/-ing,
+    final-e drop (migrate→migrating), and y→ies. Irregulars come from a table.
+    Not a full lemmatizer — just enough that 'implementing' matches 'implement'.
+    """
+    forms = {verb, verb + "s", verb + "ed", verb + "ing", verb + "d"}
+    if verb.endswith("e"):
+        forms |= {verb[:-1] + "ing", verb[:-1] + "ed", verb[:-1] + "es"}
+    if verb.endswith("y") and len(verb) > 2 and verb[-2] not in "aeiou":
+        forms |= {verb[:-1] + "ies", verb[:-1] + "ied"}
+    forms |= set(_IRREGULAR.get(verb, ()))
+    return forms
+
+
+def _compile_words(words: set[str]) -> "re.Pattern[str]":
+    longest_first = sorted(words, key=len, reverse=True)
+    return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in longest_first) + r")\b",
+                      flags=re.IGNORECASE)
+
+
+def _inflected_set(*verbs: str) -> set[str]:
+    out: set[str] = set()
+    for v in verbs:
+        out |= _inflections(v)
+    return out
+
+
+# Precompiled, inflection-aware matchers (built once at import).
+_VERB_TIER_RE = {
+    tier: _compile_words(_inflected_set(*words)) for tier, words in _VERB_TIERS.items()
+}
+_TEST_RE = _compile_words(_inflected_set("test", "spec"))
+_REFACTOR_RE = _compile_words(_inflections("refactor"))
+_ALL_RE = _compile_words({"all", "entire", "every", "everything", "whole"})
+
+# Context blocks Claude Code injects into the prompt. They inflate length/word
+# counts with text unrelated to task scope, so we strip them before extraction.
+_INJECTED_TAGS = ("ide_opened_file", "ide_selection", "system-reminder")
+_INJECTED_PAIRED_RE = re.compile(
+    r"<(" + "|".join(_INJECTED_TAGS) + r")>.*?</\1>", flags=re.DOTALL | re.IGNORECASE
+)
+_INJECTED_STRAY_RE = re.compile(
+    r"</?(?:" + "|".join(_INJECTED_TAGS) + r")>", flags=re.IGNORECASE
+)
+
+
+def strip_injected_context(prompt: str) -> str:
+    """Remove IDE/system context blocks Claude Code prepends to the user prompt."""
+    if not prompt:
+        return ""
+    cleaned = _INJECTED_PAIRED_RE.sub(" ", prompt)
+    cleaned = _INJECTED_STRAY_RE.sub(" ", cleaned)
+    return cleaned.strip()
 
 
 def extract_prompt_features(prompt: str) -> dict[str, Any]:
     """Cheap, deterministic features from the user's prompt text."""
-    prompt = prompt or ""
-    lower = prompt.lower()
+    prompt = strip_injected_context(prompt or "")
 
     verb_tier = 0
     for tier in (2, 1):
-        if any(_has_word(lower, w) for w in _VERB_TIERS[tier]):
+        if _VERB_TIER_RE[tier].search(prompt):
             verb_tier = tier
             break
 
@@ -102,11 +173,11 @@ def extract_prompt_features(prompt: str) -> dict[str, Any]:
         "word_count": len(prompt.split()),
         "has_code_block": "```" in prompt,
         "has_file_path": bool(re.search(r"[\w./-]+\.[a-zA-Z0-9]{1,5}\b", prompt)),
-        "mentions_test": _has_word(lower, "test") or _has_word(lower, "spec"),
-        "mentions_refactor": _has_word(lower, "refactor"),
+        "mentions_test": bool(_TEST_RE.search(prompt)),
+        "mentions_refactor": bool(_REFACTOR_RE.search(prompt)),
         "verb_tier": verb_tier,
         "question_count": prompt.count("?"),
-        "mentions_all": _has_word(lower, "all") or _has_word(lower, "entire") or _has_word(lower, "every"),
+        "mentions_all": bool(_ALL_RE.search(prompt)),
     }
 
 
@@ -213,7 +284,21 @@ def _load_training_data() -> tuple[list[list[float]], list[float]]:
     return X, y
 
 
+# Quantiles we fit. p50 is the point estimate; p90 drives the warning.
+QUANTILES = (0.5, 0.9)
+
+
 def train_model() -> Any | None:
+    """Fit one quantile regressor per QUANTILE on log1p(tokens).
+
+    Token cost spans ~3 orders of magnitude and is heavily right-skewed.
+    Training on raw counts with squared error chases the few huge outliers and
+    collapses to predicting the mean for everything. Log-space + quantile (pinball)
+    loss fixes both: it respects the multiplicative scale and yields an interval
+    instead of a miscalibrated point estimate.
+
+    Returns a dict {quantile: fitted_model} or None if not enough data.
+    """
     X, y = _load_training_data()
     if len(X) < MIN_TASKS_FOR_PREDICTION:
         return None
@@ -221,14 +306,20 @@ def train_model() -> Any | None:
         from sklearn.ensemble import GradientBoostingRegressor
     except ImportError:
         return None
-    model = GradientBoostingRegressor(
-        n_estimators=80,
-        max_depth=3,
-        learning_rate=0.08,
-        random_state=42,
-    )
-    model.fit(X, y)
-    return model
+    y_log = [math.log1p(v) for v in y]
+    models: dict[float, Any] = {}
+    for q in QUANTILES:
+        m = GradientBoostingRegressor(
+            loss="quantile",
+            alpha=q,
+            n_estimators=200,
+            max_depth=3,
+            learning_rate=0.05,
+            random_state=42,
+        )
+        m.fit(X, y_log)
+        models[q] = m
+    return models
 
 
 def save_model(model: Any) -> None:
@@ -268,19 +359,28 @@ def historical_stats() -> dict[str, Any]:
 
 
 def predict(prompt: str, cwd: str) -> dict[str, Any] | None:
-    """Predict total tokens for a task. Returns None if no model yet."""
-    model = load_model()
-    if model is None:
+    """Predict a token range for a task. Returns None if no usable model yet.
+
+    `predicted_tokens` is the p50 point estimate; `predicted_p90` is the upper
+    bound used for warnings. Legacy single-estimator models are treated as no
+    model (a retrain on the next milestone produces the new quantile models).
+    """
+    models = load_model()
+    if not isinstance(models, dict):
         return None
     pf = extract_prompt_features(prompt)
     rf = extract_repo_features(cwd)
     vec = features_to_vector(pf, rf)
     try:
-        pred = float(model.predict([vec])[0])
+        p50 = math.expm1(float(models[0.5].predict([vec])[0]))
+        p90 = math.expm1(float(models[0.9].predict([vec])[0]))
     except Exception:
         return None
+    p50 = max(0, int(p50))
+    p90 = max(p50, int(p90))  # quantile crossing guard
     return {
-        "predicted_tokens": max(0, int(pred)),
+        "predicted_tokens": p50,
+        "predicted_p90": p90,
         "stats": historical_stats(),
         "prompt_features": pf,
         "repo_features": rf,

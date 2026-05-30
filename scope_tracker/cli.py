@@ -136,23 +136,24 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
     print()
     print("last 10 tasks:")
-    print(f"  {'when':<12} {'actual':>9} {'pred':>9} {'err':>6}  prompt")
+    print(f"  {'when':<12} {'actual':>9} {'pred(p50)':>10} {'p90':>9} {'err':>6}  prompt")
     rows = conn.execute(
-        """SELECT started_at, actual_total_tokens, predicted_tokens, prompt
+        """SELECT started_at, actual_total_tokens, predicted_tokens, predicted_p90, prompt
            FROM tasks
            WHERE completed = 1
            ORDER BY started_at DESC LIMIT 10"""
     ).fetchall()
-    for started, actual, predicted, prompt in rows:
+    for started, actual, predicted, predicted_p90, prompt in rows:
         ts = datetime.datetime.fromtimestamp(started).strftime("%m-%d %H:%M")
         actual_s = f"{actual:,}" if actual else "—"
         pred_s = f"{predicted:,}" if predicted else "—"
+        p90_s = f"{predicted_p90:,}" if predicted_p90 else "—"
         err_s = "—"
         if actual and predicted:
             err_pct = (predicted - actual) / actual * 100
             err_s = f"{err_pct:+.0f}%"
         snippet = (prompt or "").replace("\n", " ")[:60]
-        print(f"  {ts:<12} {actual_s:>9} {pred_s:>9} {err_s:>6}  {snippet}")
+        print(f"  {ts:<12} {actual_s:>9} {pred_s:>10} {p90_s:>9} {err_s:>6}  {snippet}")
     conn.close()
     return 0
 
