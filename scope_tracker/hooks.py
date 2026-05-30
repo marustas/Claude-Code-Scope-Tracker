@@ -104,22 +104,72 @@ def on_prompt_submit() -> int:
     return 0
 
 
+def _format_midtask_warning(tokens_so_far: int, projected: int,
+                            projected_p90: int, tools: int, stats: dict) -> str:
+    return (
+        f"[scope-tracker — mid-task notice for the user]: this task has already used "
+        f"~{tokens_so_far:,} tokens across {tools} tool calls and is now projected to "
+        f"finish around ~{projected:,} tokens, up to ~{projected_p90:,} (90th percentile) "
+        f"— above your usual range (mean {stats['mean']:,}). Tasks like this sometimes "
+        f"hit context limits before completing. Consider wrapping up the current step, "
+        f"committing partial progress, or narrowing the remaining work. (This is from a "
+        f"local hook, not from Claude. Mention it briefly to the user and offer to scope "
+        f"down the rest, then continue.)"
+    )
+
+
 def on_tool_use() -> int:
-    """PostToolUse: increment tool counter for the current open task."""
+    """PostToolUse: count the tool call, and once signal is solid, re-project the
+    final cost from what's been spent so far — warning once if it looks high."""
     data = _read_stdin_json()
     session_id = data.get("session_id") or "unknown"
 
     conn = core.db()
-    conn.execute(
-        """UPDATE tasks SET tool_calls = tool_calls + 1
-           WHERE task_id = (
-               SELECT task_id FROM tasks
-               WHERE session_id = ? AND completed = 0
-               ORDER BY started_at DESC LIMIT 1
-           )""",
+    row = conn.execute(
+        """SELECT task_id, tool_calls, prompt_features, repo_features,
+                  transcript_path, transcript_start_line, midtask_warned
+           FROM tasks
+           WHERE session_id = ? AND completed = 0
+           ORDER BY started_at DESC LIMIT 1""",
         (session_id,),
-    )
+    ).fetchone()
+    if not row:
+        conn.close()
+        return 0
+
+    task_id, tool_calls, pf_json, rf_json, tpath, start_line, warned = row
+    tool_calls = (tool_calls or 0) + 1
+    conn.execute("UPDATE tasks SET tool_calls = ? WHERE task_id = ?", (tool_calls, task_id))
     conn.commit()
+
+    # Mid-task re-estimate. Guarded separately so a prediction error can never
+    # undo the counter update above or crash the hook.
+    try:
+        if (not warned) and tool_calls >= core.MIDTASK_MIN_TOOL_CALLS:
+            stats = core.historical_stats()
+            if stats["n"] >= core.MIN_TASKS_FOR_PREDICTION:
+                pf = json.loads(pf_json or "{}")
+                rf = json.loads(rf_json or "{}")
+                tokens_so_far = core.parse_usage(tpath, from_line=start_line or 0)["total_tokens"]
+                proj = core.predict_midtask(pf, rf, tool_calls, tokens_so_far)
+                if proj:
+                    threshold = max(core.WARN_ABSOLUTE_FLOOR,
+                                    int(stats["mean"] * core.WARN_MULTIPLIER))
+                    if proj["predicted_p90"] > threshold:
+                        warn = _format_midtask_warning(
+                            tokens_so_far, proj["predicted_tokens"],
+                            proj["predicted_p90"], tool_calls, stats)
+                        print(json.dumps({"hookSpecificOutput": {
+                            "hookEventName": "PostToolUse",
+                            "additionalContext": warn,
+                        }}))
+                        conn.execute(
+                            "UPDATE tasks SET midtask_warned = 1 WHERE task_id = ?",
+                            (task_id,))
+                        conn.commit()
+    except Exception:  # noqa: BLE001 — mid-task estimate must never break counting
+        pass
+
     conn.close()
     return 0
 
@@ -182,5 +232,8 @@ def on_stop() -> int:
             model = core.train_model()
             if model is not None:
                 core.save_model(model)
+            midtask = core.train_midtask_model()
+            if midtask is not None:
+                core.save_midtask_model(midtask)
 
     return 0

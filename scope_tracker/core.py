@@ -22,10 +22,16 @@ from typing import Any
 DATA_DIR = Path(os.environ.get("SCOPE_TRACKER_HOME", Path.home() / ".scope-tracker"))
 DB_PATH = DATA_DIR / "sessions.db"
 MODEL_PATH = DATA_DIR / "model.pkl"
+MIDTASK_MODEL_PATH = DATA_DIR / "model_midtask.pkl"
 
 MIN_TASKS_FOR_PREDICTION = 20  # stay silent until we have this many labeled tasks
 WARN_ABSOLUTE_FLOOR = 50_000   # never warn below this many tokens, regardless of history
 WARN_MULTIPLIER = 2.0          # warn if predicted > this * historical_mean
+
+# Mid-task re-estimate (fix D): once a task is underway, observed cost-so-far is a
+# far stronger signal than the prompt. We re-project the final total from it.
+MIDTASK_MIN_TOOL_CALLS = 3       # don't re-estimate until there's real signal
+MIN_MIDTASK_ROWS = 50            # min replayed checkpoints before the model trains
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -72,6 +78,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "predicted_p90" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN predicted_p90 INTEGER")
+        conn.commit()
+    if "midtask_warned" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN midtask_warned INTEGER DEFAULT 0")
         conn.commit()
 
 
@@ -457,3 +466,169 @@ def parse_usage(path: str, from_line: int = 0) -> dict[str, int]:
         + totals["cache_creation_input_tokens"]
     )
     return totals
+
+
+# --- Mid-task model (fix D) ---
+#
+# Once a task is underway, the cost accumulated so far predicts the final total
+# far better than the prompt ever could. We re-project from (submit features +
+# tool_calls_so_far + tokens_so_far). Trained offline by replaying transcripts;
+# at runtime the PostToolUse hook calls predict_midtask once signal is solid.
+
+MIDTASK_FEATURE_NAMES = FEATURE_NAMES + ("tool_calls_so_far", "log_tokens_so_far")
+
+
+def midtask_vector(pf: dict, rf: dict, tools_so_far: int, tokens_so_far: float) -> list[float]:
+    return features_to_vector(pf, rf) + [
+        float(tools_so_far),
+        math.log1p(max(0.0, float(tokens_so_far))),
+    ]
+
+
+def _region_checkpoints(path: str, start: int, end: int | None) -> list[tuple[int, int]]:
+    """Replay one task's transcript region, returning a (tool_calls, tokens)
+    checkpoint after each assistant message. `end` bounds the region (the next
+    task's start line in the same transcript), or None for end-of-file."""
+    cum_tok = 0
+    cum_tools = 0
+    ckpts: list[tuple[int, int]] = []
+    if not path or not os.path.exists(path):
+        return ckpts
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i < (start or 0):
+                    continue
+                if end is not None and i >= end:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = rec.get("message", rec)
+                usage = msg.get("usage") or rec.get("usage") or {}
+                if isinstance(usage, dict):
+                    for k in ("input_tokens", "output_tokens",
+                              "cache_creation_input_tokens"):
+                        v = usage.get(k)
+                        if isinstance(v, int):
+                            cum_tok += v
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            cum_tools += 1
+                ckpts.append((cum_tools, cum_tok))
+    except OSError:
+        return ckpts
+    return ckpts
+
+
+def _midtask_training_rows() -> tuple[list[list[float]], list[float]]:
+    """Build mid-task training data by replaying stored transcripts.
+
+    Emits one row per checkpoint where tool_calls_so_far >= MIDTASK_MIN_TOOL_CALLS,
+    pairing the state at that moment with the task's final total. Many checkpoints
+    per task makes the model robust to *when* it's asked to predict.
+    """
+    conn = db()
+    rows = conn.execute(
+        """SELECT prompt_features, repo_features, transcript_path,
+                  transcript_start_line, actual_total_tokens
+           FROM tasks
+           WHERE completed = 1 AND actual_total_tokens > 0
+             AND transcript_path IS NOT NULL
+           ORDER BY transcript_path, transcript_start_line"""
+    ).fetchall()
+    conn.close()
+
+    # Map each transcript region to the next task's start line in that file.
+    starts_by_path: dict[str, list[int]] = {}
+    for _, _, path, start, _ in rows:
+        if path is not None and start is not None:
+            starts_by_path.setdefault(path, []).append(start)
+    for path in starts_by_path:
+        starts_by_path[path].sort()
+
+    X: list[list[float]] = []
+    y: list[float] = []
+    for pf_json, rf_json, path, start, final in rows:
+        try:
+            pf = json.loads(pf_json or "{}")
+            rf = json.loads(rf_json or "{}")
+        except json.JSONDecodeError:
+            continue
+        starts = starts_by_path.get(path, [])
+        end = next((s for s in starts if start is not None and s > start), None)
+        ckpts = _region_checkpoints(path, start or 0, end)
+        for tools, tokens in ckpts:
+            if tools >= MIDTASK_MIN_TOOL_CALLS:
+                X.append(midtask_vector(pf, rf, tools, tokens))
+                y.append(float(final))
+    return X, y
+
+
+def train_midtask_model() -> Any | None:
+    """Fit log-space quantile models projecting final tokens from mid-task state.
+    Returns {quantile: model} or None if there isn't enough replayed signal yet."""
+    X, y = _midtask_training_rows()
+    if len(X) < MIN_MIDTASK_ROWS:
+        return None
+    try:
+        from sklearn.ensemble import GradientBoostingRegressor
+    except ImportError:
+        return None
+    y_log = [math.log1p(v) for v in y]
+    models: dict[float, Any] = {}
+    for q in QUANTILES:
+        m = GradientBoostingRegressor(
+            loss="quantile", alpha=q, n_estimators=200,
+            max_depth=3, learning_rate=0.05, random_state=42,
+        )
+        m.fit(X, y_log)
+        models[q] = m
+    return models
+
+
+def load_midtask_model() -> Any | None:
+    if not MIDTASK_MODEL_PATH.exists():
+        return None
+    try:
+        with open(MIDTASK_MODEL_PATH, "rb") as f:
+            return pickle.load(f)
+    except (pickle.PickleError, OSError, EOFError):
+        return None
+
+
+def save_midtask_model(model: Any) -> None:
+    if model is None:
+        return
+    ensure_dirs()
+    with open(MIDTASK_MODEL_PATH, "wb") as f:
+        pickle.dump(model, f)
+
+
+def predict_midtask(pf: dict, rf: dict, tools_so_far: int,
+                    tokens_so_far: float) -> dict[str, Any] | None:
+    """Project final total tokens from observed mid-task state. None if no model."""
+    models = load_midtask_model()
+    if not isinstance(models, dict):
+        return None
+    vec = midtask_vector(pf, rf, tools_so_far, tokens_so_far)
+    try:
+        p50 = math.expm1(float(models[0.5].predict([vec])[0]))
+        p90 = math.expm1(float(models[0.9].predict([vec])[0]))
+    except Exception:
+        return None
+    p50 = max(0, int(p50))
+    # Final can't be less than what's already burned, nor p90 below p50.
+    p50 = max(p50, int(tokens_so_far))
+    p90 = max(p50, int(p90))
+    return {
+        "predicted_tokens": p50,
+        "predicted_p90": p90,
+        "stats": historical_stats(),
+    }
