@@ -150,8 +150,10 @@ def on_tool_use() -> int:
             if stats["n"] >= core.MIN_TASKS_FOR_PREDICTION:
                 pf = json.loads(pf_json or "{}")
                 rf = json.loads(rf_json or "{}")
-                tokens_so_far = core.parse_usage(tpath, from_line=start_line or 0)["total_tokens"]
-                proj = core.predict_midtask(pf, rf, tool_calls, tokens_so_far)
+                usage = core.parse_usage(tpath, from_line=start_line or 0)
+                tokens_so_far = usage["total_tokens"]
+                proj = core.predict_midtask(pf, rf, tool_calls, tokens_so_far,
+                                            usage.get("tool_counts"))
                 if proj:
                     threshold = max(core.WARN_ABSOLUTE_FLOOR,
                                     int(stats["mean"] * core.WARN_MULTIPLIER))
