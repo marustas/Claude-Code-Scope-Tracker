@@ -65,55 +65,61 @@ def _fit(X, y):
 
 
 def _first_checkpoint(ck):
-    for tools, tokens in ck:
+    for tools, tokens, counts in ck:
         if tools >= core.MIDTASK_MIN_TOOL_CALLS:
-            return tools, tokens
+            return tools, tokens, counts
     return None
 
 
-def evaluate(tasks, folds=5):
-    """Task-level k-fold: within-2x of the mid-task p50 at first-fire checkpoint."""
+def evaluate(tasks, folds=5, seeds=(0, 1, 2, 3, 4)):
+    """Task-level k-fold within-2x of the mid-task p50 at the first-fire checkpoint,
+    averaged over several shuffles. Single-seed CV on ~70 tasks swings ±8 pts, so
+    we average to report a number that isn't an artifact of one lucky split."""
     eligible = [t for t in tasks if _first_checkpoint(t[3])]
     if len(eligible) < folds * 2:
         print(f"  (only {len(eligible)} tasks reach {core.MIDTASK_MIN_TOOL_CALLS} "
               f"tool calls — eval skipped)")
         return
-    rng = random.Random(0)
-    rng.shuffle(eligible)
-    buckets = [eligible[i::folds] for i in range(folds)]
 
-    within2x = 0
-    p90_cov = 0
-    evaluated = 0
-    for f in range(folds):
-        test = buckets[f]
-        train = [t for i, b in enumerate(buckets) if i != f for t in b]
-        X, y = [], []
-        for pf, rf, final, ck in train:
-            for tools, tokens in ck:
-                if tools >= core.MIDTASK_MIN_TOOL_CALLS:
-                    X.append(core.midtask_vector(pf, rf, tools, tokens))
-                    y.append(final)
-        if len(X) < core.MIN_MIDTASK_ROWS:
-            continue
-        models = _fit(X, y)
-        for pf, rf, final, ck in test:
-            cp = _first_checkpoint(ck)
-            if not cp:
+    w2_runs, cov_runs = [], []
+    for seed in seeds:
+        pool = eligible[:]
+        random.Random(seed).shuffle(pool)
+        buckets = [pool[i::folds] for i in range(folds)]
+        within2x = p90_cov = evaluated = 0
+        for f in range(folds):
+            test = buckets[f]
+            train = [t for i, b in enumerate(buckets) if i != f for t in b]
+            X, y = [], []
+            for pf, rf, final, ck in train:
+                for tools, tokens, counts in ck:
+                    if tools >= core.MIDTASK_MIN_TOOL_CALLS:
+                        X.append(core.midtask_vector(pf, rf, tools, tokens, counts))
+                        y.append(final)
+            if len(X) < core.MIN_MIDTASK_ROWS:
                 continue
-            tools, tokens = cp
-            vec = core.midtask_vector(pf, rf, tools, tokens)
-            p50 = max(tokens, math.expm1(float(models[0.5].predict([vec])[0])))
-            p90 = max(p50, math.expm1(float(models[0.9].predict([vec])[0])))
-            if final and 0.5 <= p50 / final <= 2.0:
-                within2x += 1
-            if final <= p90:
-                p90_cov += 1
-            evaluated += 1
-    if evaluated:
-        print(f"  mid-task (at first ≥{core.MIDTASK_MIN_TOOL_CALLS} tool calls): "
-              f"within-2x = {within2x/evaluated*100:.0f}%   "
-              f"p90 coverage = {p90_cov/evaluated*100:.0f}%   (n={evaluated})")
+            models = _fit(X, y)
+            for pf, rf, final, ck in test:
+                cp = _first_checkpoint(ck)
+                if not cp:
+                    continue
+                tools, tokens, counts = cp
+                vec = core.midtask_vector(pf, rf, tools, tokens, counts)
+                p50 = max(tokens, math.expm1(float(models[0.5].predict([vec])[0])))
+                p90 = max(p50, math.expm1(float(models[0.9].predict([vec])[0])))
+                if final and 0.5 <= p50 / final <= 2.0:
+                    within2x += 1
+                if final <= p90:
+                    p90_cov += 1
+                evaluated += 1
+        if evaluated:
+            w2_runs.append(within2x / evaluated * 100)
+            cov_runs.append(p90_cov / evaluated * 100)
+    if w2_runs:
+        print(f"  mid-task (at first ≥{core.MIDTASK_MIN_TOOL_CALLS} tool calls, "
+              f"avg of {len(w2_runs)} seeds): "
+              f"within-2x = {statistics.mean(w2_runs):.0f}%   "
+              f"p90 coverage = {statistics.mean(cov_runs):.0f}%   (n={len(eligible)})")
         print(f"  submit-time baseline was ~41% within-2x")
 
 

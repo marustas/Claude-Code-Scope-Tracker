@@ -131,11 +131,29 @@ class TestMidTaskModel(unittest.TestCase):
     def test_midtask_vector_length(self):
         pf = core.extract_prompt_features("implement a thing")
         rf = {"file_count": 100}
-        vec = core.midtask_vector(pf, rf, tools_so_far=4, tokens_so_far=12000)
+        counts = {"Bash": 2, "Edit": 1, "Read": 1}
+        vec = core.midtask_vector(pf, rf, tools_so_far=4, tokens_so_far=12000,
+                                  tool_counts=counts)
         self.assertEqual(len(vec), len(core.MIDTASK_FEATURE_NAMES))
-        # appended features: tool count raw, tokens in log space
-        self.assertEqual(vec[-2], 4.0)
-        self.assertAlmostEqual(vec[-1], math.log1p(12000))
+        # tool_calls_so_far and log tokens sit just before the 6 tool-type features
+        self.assertEqual(vec[len(core.FEATURE_NAMES)], 4.0)
+        self.assertAlmostEqual(vec[len(core.FEATURE_NAMES) + 1], math.log1p(12000))
+
+    def test_midtask_vector_stable_length_without_counts(self):
+        # Missing tool_counts must not change vector length (all-zero tool features).
+        vec = core.midtask_vector({}, {}, tools_so_far=3, tokens_so_far=5000)
+        self.assertEqual(len(vec), len(core.MIDTASK_FEATURE_NAMES))
+
+    def test_tool_type_features(self):
+        # 2 Bash + 1 Edit + 1 Read over 4 calls; TaskCreate flags a subagent spawn.
+        feats = core.tool_type_features({"Bash": 2, "Edit": 1, "Read": 1, "TaskCreate": 1}, 4)
+        exec_frac, explore_frac, mutate_frac, mutate_count, distinct, subagent = feats
+        self.assertAlmostEqual(exec_frac, 0.5)
+        self.assertAlmostEqual(explore_frac, 0.25)
+        self.assertAlmostEqual(mutate_frac, 0.25)
+        self.assertEqual(mutate_count, 1.0)
+        self.assertEqual(distinct, 4.0)
+        self.assertEqual(subagent, 1.0)
 
     def test_predict_midtask_floors_at_spent_and_clamps_p90(self):
         from unittest import mock
@@ -144,7 +162,8 @@ class TestMidTaskModel(unittest.TestCase):
         crossing = {0.5: _ConstModel(9.0), 0.9: _ConstModel(8.0)}
         with mock.patch.object(core, "load_midtask_model", return_value=crossing):
             out = core.predict_midtask({"verb_tier": 2}, {"file_count": 100},
-                                       tools_so_far=5, tokens_so_far=40000)
+                                       tools_so_far=5, tokens_so_far=40000,
+                                       tool_counts={"Edit": 3, "Bash": 2})
         self.assertIsNotNone(out)
         self.assertGreaterEqual(out["predicted_tokens"], 40000)  # floored at spent
         self.assertGreaterEqual(out["predicted_p90"], out["predicted_tokens"])
