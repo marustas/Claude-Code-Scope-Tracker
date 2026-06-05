@@ -49,6 +49,29 @@ def _format_warning(predicted: int, predicted_p90: int, stats: dict) -> str:
     )
 
 
+def _fmt_hours(seconds: float) -> str:
+    h = seconds / 3600
+    if h >= 1:
+        return f"~{h:.1f}h"
+    return f"~{int(seconds / 60)}min"
+
+
+def _format_session_warning(used: int, projected_task: int, budget: int,
+                            relief_seconds: float, window_hours: float) -> str:
+    projected_total = used + projected_task
+    pct = projected_total / budget * 100 if budget else 0
+    return (
+        f"[scope-tracker — session-budget notice for the user]: in the last "
+        f"{window_hours:.0f}h you've used ~{used:,} tokens of your ~{budget:,} session "
+        f"limit. This task is estimated to add ~{projected_task:,}, which would put you "
+        f"at ~{projected_total:,} ({pct:.0f}% of the limit). You risk hitting the "
+        f"resets-every-few-hours cap mid-task; the window starts freeing up in "
+        f"{_fmt_hours(relief_seconds)}. Consider a smaller task now or waiting for the "
+        f"reset. (This is from a local hook, not from Claude. Mention it briefly to the "
+        f"user, then proceed.)"
+    )
+
+
 def on_prompt_submit() -> int:
     """UserPromptSubmit: record task start, predict, optionally warn."""
     data = _read_stdin_json()
@@ -100,6 +123,21 @@ def on_prompt_submit() -> int:
                         int(pred["stats"]["mean"] * core.WARN_MULTIPLIER))
         if predicted_p90 and predicted_p90 > threshold:
             print(_format_warning(predicted_tokens, predicted_p90, pred["stats"]))
+
+    # Session-budget warning: would this task push rolling-window usage over the
+    # quota that resets every few hours? Independent of the per-task model — fires
+    # on consumed-so-far plus the best available estimate for this task.
+    if core.SESSION_BUDGET > 0:
+        try:
+            su = core.session_window_usage()
+            stats = pred["stats"] if pred else core.historical_stats()
+            projected_task = predicted_p90 or predicted_tokens or stats.get("mean", 0)
+            if su["used"] + projected_task > core.SESSION_BUDGET * core.SESSION_WARN_FRACTION:
+                print(_format_session_warning(
+                    su["used"], int(projected_task), core.SESSION_BUDGET,
+                    su["relief_in_seconds"], su["window_hours"]))
+        except Exception:  # noqa: BLE001 — must never crash the hook
+            pass
 
     return 0
 

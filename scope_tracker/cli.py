@@ -134,6 +134,16 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"  min:  {stats['min']:>9,}")
     print(f"  max:  {stats['max']:>9,}")
 
+    su = core.session_window_usage()
+    print()
+    print(f"rolling {su['window_hours']:.0f}h session window:")
+    print(f"  used:   {su['used']:>9,}  ({su['tasks_in_window']} tasks)")
+    if core.SESSION_BUDGET > 0:
+        pct = su["used"] / core.SESSION_BUDGET * 100
+        print(f"  budget: {core.SESSION_BUDGET:>9,}  ({pct:.0f}% used, plan: {core._PLAN})")
+    else:
+        print("  budget: (disabled — set SCOPE_TRACKER_SESSION_BUDGET to re-enable)")
+
     print()
     print("last 10 tasks:")
     print(f"  {'when':<12} {'actual':>9} {'pred(p50)':>10} {'p90':>9} {'err':>6}  prompt")

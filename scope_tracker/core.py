@@ -28,6 +28,44 @@ MIN_TASKS_FOR_PREDICTION = 20  # stay silent until we have this many labeled tas
 WARN_ABSOLUTE_FLOOR = 50_000   # never warn below this many tokens, regardless of history
 WARN_MULTIPLIER = 2.0          # warn if predicted > this * historical_mean
 
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+# Rolling session quota (the usage limit that resets every few hours). Usage is
+# bursty, so a task can run the window dry mid-execution.
+#
+# The window is 5h on every plan, so it's fixed. The budget derives from the
+# subscription tier — Pro is the base, the Max tiers scale 5x / 20x. These token
+# figures are estimates (Anthropic doesn't publish the cap as a clean number);
+# tune with SCOPE_TRACKER_SESSION_BUDGET, which overrides the tier default.
+# Set SCOPE_TRACKER_SESSION_BUDGET=0 to turn the warning off entirely.
+SESSION_WINDOW_HOURS = 5.0  # fixed across all plans
+
+PLAN_BUDGETS = {
+    "pro": 2_000_000,
+    "max5x": 10_000_000,
+    "max20x": 40_000_000,
+}
+DEFAULT_PLAN = "pro"
+_PLAN = os.environ.get("SCOPE_TRACKER_PLAN", DEFAULT_PLAN).strip().lower()
+SESSION_BUDGET = _env_int(
+    "SCOPE_TRACKER_SESSION_BUDGET",
+    PLAN_BUDGETS.get(_PLAN, PLAN_BUDGETS[DEFAULT_PLAN]),
+)
+SESSION_WARN_FRACTION = _env_float("SCOPE_TRACKER_SESSION_WARN_FRACTION", 0.8)
+
 # Mid-task re-estimate (fix D): once a task is underway, observed cost-so-far is a
 # far stronger signal than the prompt. We re-project the final total from it.
 MIDTASK_MIN_TOOL_CALLS = 3       # don't re-estimate until there's real signal
@@ -265,6 +303,38 @@ def features_to_vector(pf: dict, rf: dict) -> list[float]:
         float(int(pf.get("mentions_all", False))),
         float(rf.get("file_count", 0)),
     ]
+
+
+# --- Rolling session quota ---
+
+def session_window_usage(at_time: float | None = None,
+                         window_hours: float | None = None) -> dict[str, Any]:
+    """Tokens consumed in the current rolling window (default the last 5 hours).
+
+    Models Claude's resets-every-few-hours usage limit: sum the total_tokens of
+    completed tasks whose start falls inside [now - window, now]. Also returns when
+    the oldest in-window task ages out, i.e. roughly when quota starts freeing up.
+    """
+    window = (window_hours if window_hours is not None else SESSION_WINDOW_HOURS) * 3600
+    now = at_time if at_time is not None else time.time()
+    conn = db()
+    rows = conn.execute(
+        """SELECT started_at, actual_total_tokens FROM tasks
+           WHERE completed = 1 AND actual_total_tokens > 0
+             AND started_at >= ? AND started_at <= ?""",
+        (now - window, now),
+    ).fetchall()
+    conn.close()
+    used = sum(int(tok) for _, tok in rows if tok)
+    oldest = min((ts for ts, _ in rows), default=None)
+    # When the oldest in-window task leaves the window, that much quota frees up.
+    relief_in = (oldest + window - now) if oldest is not None else 0.0
+    return {
+        "used": used,
+        "window_hours": window / 3600,
+        "tasks_in_window": len(rows),
+        "relief_in_seconds": max(0.0, relief_in),
+    }
 
 
 # --- Model ---
