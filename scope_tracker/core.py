@@ -295,40 +295,88 @@ def _load_training_data() -> tuple[list[list[float]], list[float]]:
 
 # Quantiles we fit. p50 is the point estimate; p90 drives the warning.
 QUANTILES = (0.5, 0.9)
+P90_CORR_KEY = "p90_log_correction"  # conformal adjustment, in log space
+
+
+def _make_gbr(alpha: float):
+    from sklearn.ensemble import GradientBoostingRegressor
+    return GradientBoostingRegressor(
+        loss="quantile", alpha=alpha, n_estimators=200,
+        max_depth=3, learning_rate=0.05, random_state=42,
+    )
+
+
+CONFORMAL_CALIB_FRAC = 0.2     # share of groups held out to calibrate the p90 bound
+MIN_CONFORMAL_CALIB_ROWS = 150  # below this, the 90% score quantile is too noisy
+
+
+def _fit_quantile_bundle(X: list, y: list, groups: list | None = None,
+                         level: float = 0.9) -> Any | None:
+    """Fit p50/p90 on log1p(y), with a split-conformal p90 correction when there's
+    enough calibration data to estimate it reliably.
+
+    Split conformal: train the quantile models on most of the data, hold out a
+    calibration slice, and shift the p90 bound by the finite-sample conformal
+    quantile of (y - predicted_p90) on that slice. Calibrating the *same* model
+    that ships gives a valid >= `level` coverage guarantee. Groups (a task id per
+    row) keep a task's checkpoints from spanning the train/calibration boundary.
+
+    With a small calibration set the 90% score quantile is essentially the max and
+    the correction overshoots — so below MIN_CONFORMAL_CALIB_ROWS we skip it, fit
+    on all data, and keep the nominal (uncorrected) p90. In practice conformal
+    engages for the data-rich mid-task model and the submit-time prior stays
+    nominal rather than burning its scarce data on a noisy correction.
+    """
+    try:
+        import sklearn.ensemble  # noqa: F401
+    except ImportError:
+        return None
+    y_log = [math.log1p(v) for v in y]
+    n = len(X)
+    if groups is None:
+        groups = list(range(n))
+    uniq = list(dict.fromkeys(groups))
+    import random as _random
+    _random.Random(42).shuffle(uniq)
+    n_cal = int(round(len(uniq) * CONFORMAL_CALIB_FRAC))
+
+    # The p50 point estimate always trains on ALL data — it drives within-2x and
+    # needs no calibration. Only the p90 bound uses the split.
+    bundle: dict[Any, Any] = {0.5: _make_gbr(0.5).fit(X, y_log)}
+
+    calib = set(uniq[:n_cal]) if n_cal >= 1 else set()
+    ca = [i for i in range(n) if groups[i] in calib]
+    if len(ca) < MIN_CONFORMAL_CALIB_ROWS or len(uniq) - n_cal < 2:
+        # Not enough to calibrate reliably — fit p90 on all data, no correction.
+        bundle[0.9] = _make_gbr(0.9).fit(X, y_log)
+        bundle[P90_CORR_KEY] = 0.0
+        return bundle
+
+    tr = [i for i in range(n) if groups[i] not in calib]
+    bundle[0.9] = _make_gbr(0.9).fit([X[i] for i in tr], [y_log[i] for i in tr])
+    preds = bundle[0.9].predict([X[i] for i in ca])
+    scores = sorted(float(y_log[i] - p) for i, p in zip(ca, preds))
+    # Smallest c with >= level of (y - p90) <= c. Finite-sample rank, clamped.
+    k = min(len(scores), math.ceil((len(scores) + 1) * level))
+    bundle[P90_CORR_KEY] = scores[k - 1]
+    return bundle
 
 
 def train_model() -> Any | None:
-    """Fit one quantile regressor per QUANTILE on log1p(tokens).
+    """Fit log-space quantile models (p50/p90 + conformal correction) on token cost.
 
-    Token cost spans ~3 orders of magnitude and is heavily right-skewed.
-    Training on raw counts with squared error chases the few huge outliers and
-    collapses to predicting the mean for everything. Log-space + quantile (pinball)
-    loss fixes both: it respects the multiplicative scale and yields an interval
-    instead of a miscalibrated point estimate.
+    Token cost spans ~3 orders of magnitude and is heavily right-skewed. Training
+    on raw counts with squared error chases the few huge outliers and collapses to
+    the mean. Log-space + quantile (pinball) loss respects the multiplicative scale
+    and yields an interval; the conformal correction makes the p90 a real coverage
+    guarantee rather than a nominal one.
 
-    Returns a dict {quantile: fitted_model} or None if not enough data.
+    Returns a dict {0.5: model, 0.9: model, P90_CORR_KEY: float} or None.
     """
     X, y = _load_training_data()
     if len(X) < MIN_TASKS_FOR_PREDICTION:
         return None
-    try:
-        from sklearn.ensemble import GradientBoostingRegressor
-    except ImportError:
-        return None
-    y_log = [math.log1p(v) for v in y]
-    models: dict[float, Any] = {}
-    for q in QUANTILES:
-        m = GradientBoostingRegressor(
-            loss="quantile",
-            alpha=q,
-            n_estimators=200,
-            max_depth=3,
-            learning_rate=0.05,
-            random_state=42,
-        )
-        m.fit(X, y_log)
-        models[q] = m
-    return models
+    return _fit_quantile_bundle(X, y)
 
 
 def save_model(model: Any) -> None:
@@ -381,8 +429,9 @@ def predict(prompt: str, cwd: str) -> dict[str, Any] | None:
     rf = extract_repo_features(cwd)
     vec = features_to_vector(pf, rf)
     try:
+        corr = float(models.get(P90_CORR_KEY, 0.0))
         p50 = math.expm1(float(models[0.5].predict([vec])[0]))
-        p90 = math.expm1(float(models[0.9].predict([vec])[0]))
+        p90 = math.expm1(float(models[0.9].predict([vec])[0]) + corr)
     except Exception:
         return None
     p50 = max(0, int(p50))
@@ -564,12 +613,13 @@ def _region_checkpoints(path: str, start: int, end: int | None) -> list[tuple[in
     return ckpts
 
 
-def _midtask_training_rows() -> tuple[list[list[float]], list[float]]:
+def _midtask_training_rows() -> tuple[list[list[float]], list[float], list[int]]:
     """Build mid-task training data by replaying stored transcripts.
 
     Emits one row per checkpoint where tool_calls_so_far >= MIDTASK_MIN_TOOL_CALLS,
     pairing the state at that moment with the task's final total. Many checkpoints
-    per task makes the model robust to *when* it's asked to predict.
+    per task makes the model robust to *when* it's asked to predict. Also returns a
+    `groups` list (one task id per row) so calibration folds stay task-disjoint.
     """
     conn = db()
     rows = conn.execute(
@@ -592,7 +642,8 @@ def _midtask_training_rows() -> tuple[list[list[float]], list[float]]:
 
     X: list[list[float]] = []
     y: list[float] = []
-    for pf_json, rf_json, path, start, final in rows:
+    groups: list[int] = []
+    for task_idx, (pf_json, rf_json, path, start, final) in enumerate(rows):
         try:
             pf = json.loads(pf_json or "{}")
             rf = json.loads(rf_json or "{}")
@@ -605,29 +656,17 @@ def _midtask_training_rows() -> tuple[list[list[float]], list[float]]:
             if tools >= MIDTASK_MIN_TOOL_CALLS:
                 X.append(midtask_vector(pf, rf, tools, tokens, counts))
                 y.append(float(final))
-    return X, y
+                groups.append(task_idx)
+    return X, y, groups
 
 
 def train_midtask_model() -> Any | None:
-    """Fit log-space quantile models projecting final tokens from mid-task state.
-    Returns {quantile: model} or None if there isn't enough replayed signal yet."""
-    X, y = _midtask_training_rows()
+    """Fit log-space quantile models (p50/p90 + conformal p90 correction) projecting
+    final tokens from mid-task state. None if there isn't enough replayed signal."""
+    X, y, groups = _midtask_training_rows()
     if len(X) < MIN_MIDTASK_ROWS:
         return None
-    try:
-        from sklearn.ensemble import GradientBoostingRegressor
-    except ImportError:
-        return None
-    y_log = [math.log1p(v) for v in y]
-    models: dict[float, Any] = {}
-    for q in QUANTILES:
-        m = GradientBoostingRegressor(
-            loss="quantile", alpha=q, n_estimators=200,
-            max_depth=3, learning_rate=0.05, random_state=42,
-        )
-        m.fit(X, y_log)
-        models[q] = m
-    return models
+    return _fit_quantile_bundle(X, y, groups=groups)
 
 
 def load_midtask_model() -> Any | None:
@@ -656,8 +695,9 @@ def predict_midtask(pf: dict, rf: dict, tools_so_far: int, tokens_so_far: float,
         return None
     vec = midtask_vector(pf, rf, tools_so_far, tokens_so_far, tool_counts)
     try:
+        corr = float(models.get(P90_CORR_KEY, 0.0))
         p50 = math.expm1(float(models[0.5].predict([vec])[0]))
-        p90 = math.expm1(float(models[0.9].predict([vec])[0]))
+        p90 = math.expm1(float(models[0.9].predict([vec])[0]) + corr)
     except Exception:
         return None
     p50 = max(0, int(p50))
