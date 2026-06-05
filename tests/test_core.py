@@ -202,5 +202,40 @@ class TestMidTaskModel(unittest.TestCase):
             self.assertIsNone(core.predict_midtask({}, {}, 5, 1000))
 
 
+class TestSessionWindow(unittest.TestCase):
+    def test_window_sums_recent_tasks_only(self):
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            with mock.patch.object(core, "DATA_DIR", d), \
+                 mock.patch.object(core, "DB_PATH", d / "sessions.db"):
+                now = time.time()
+                conn = core.db()
+                conn.execute(
+                    "INSERT INTO tasks (task_id, session_id, started_at, "
+                    "actual_total_tokens, completed) VALUES (?, ?, ?, ?, 1)",
+                    ("in", "s", now - 3600, 120_000))       # 1h ago — inside 5h
+                conn.execute(
+                    "INSERT INTO tasks (task_id, session_id, started_at, "
+                    "actual_total_tokens, completed) VALUES (?, ?, ?, ?, 1)",
+                    ("out", "s", now - 6 * 3600, 999_000))   # 6h ago — outside
+                conn.execute(
+                    "INSERT INTO tasks (task_id, session_id, started_at, "
+                    "actual_total_tokens, completed) VALUES (?, ?, ?, ?, 1)",
+                    ("future", "s", now + 3600, 999_000))    # after `now` — excluded
+                conn.commit()
+                conn.close()
+
+                su = core.session_window_usage(at_time=now, window_hours=5)
+                self.assertEqual(su["used"], 120_000)        # only the in-window task
+                self.assertEqual(su["tasks_in_window"], 1)
+                # oldest in-window task (1h in) frees up ~4h from now
+                self.assertAlmostEqual(su["relief_in_seconds"], 4 * 3600, delta=5)
+
+
 if __name__ == "__main__":
     unittest.main()
