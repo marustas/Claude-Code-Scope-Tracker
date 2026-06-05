@@ -62,6 +62,45 @@ last 10 tasks:
   ...
 ```
 
+## session budget (rolling-window quota)
+
+Claude's usage limit resets every few hours, and usage is bursty — a single task
+can run the window dry mid-execution. If you set a budget, the tool tracks how
+much you've spent in the rolling window and warns before a task is likely to push
+you over:
+
+```bash
+export SCOPE_TRACKER_SESSION_BUDGET=1500000   # tokens per window (plan-specific; off if unset)
+export SCOPE_TRACKER_SESSION_WINDOW_HOURS=5   # rolling window length (default 5)
+export SCOPE_TRACKER_SESSION_WARN_FRACTION=0.9  # warn at this fraction of budget
+```
+
+`scope-tracker stats` shows your current rolling-window usage against the budget.
+The warning fires at prompt-submit using consumed-so-far plus this task's p90
+estimate, and tells you roughly when the window starts freeing up.
+
+## session budget (rolling-window quota)
+
+Claude's usage limit resets every few hours, and usage is bursty — a single task
+can run the window dry mid-execution. The tool tracks how much you've spent in the
+rolling 5-hour window (fixed across plans) and warns before a task is likely to
+push you over.
+
+The budget defaults from your subscription tier — Pro is the base, the Max tiers
+scale 5×/20×:
+
+```bash
+export SCOPE_TRACKER_PLAN=pro            # pro | max5x | max20x  (default: pro)
+export SCOPE_TRACKER_SESSION_BUDGET=...  # explicit token budget; overrides the tier default
+export SCOPE_TRACKER_SESSION_WARN_FRACTION=0.8  # warn at this fraction of budget
+```
+
+The per-tier token figures are estimates (Anthropic doesn't publish the cap as a
+clean number) — set `SCOPE_TRACKER_SESSION_BUDGET` to tune it, or `=0` to turn the
+warning off. `scope-tracker stats` shows your current rolling-window usage against
+the budget. The warning fires at prompt-submit using consumed-so-far plus this
+task's p90 estimate, and tells you roughly when the window starts freeing up.
+
 ## the model
 
 Right now it's a gradient-boosted regressor over ten cheap hand-crafted features (prompt length, verb tier, file references, repo size, dominant language, etc.). It's deliberately simple. The point of v0 is to find out whether token cost is at all predictable from these signals. If it is, the model gets fancier. If it isn't, no model would help.
