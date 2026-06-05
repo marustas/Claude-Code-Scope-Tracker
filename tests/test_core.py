@@ -127,6 +127,34 @@ class TestLogSpaceQuantileModel(unittest.TestCase):
         self.assertGreaterEqual(out["predicted_p90"], out["predicted_tokens"])
 
 
+class TestConformalCalibration(unittest.TestCase):
+    def test_small_data_skips_correction(self):
+        try:
+            import sklearn.ensemble  # noqa: F401
+        except ImportError:
+            self.skipTest("scikit-learn not installed")
+        # Far fewer than MIN_CONFORMAL_CALIB_ROWS calibration rows -> no correction,
+        # both quantile models still present and fit on all data.
+        X = [[float(i % 7), float(i)] for i in range(40)]
+        y = [1000.0 + 50 * i for i in range(40)]
+        bundle = core._fit_quantile_bundle(X, y)
+        self.assertEqual(bundle[core.P90_CORR_KEY], 0.0)
+        self.assertIn(0.5, bundle)
+        self.assertIn(0.9, bundle)
+
+    def test_predict_applies_p90_correction(self):
+        from unittest import mock
+        base = 10.0
+        bundle = {0.5: _ConstModel(base), 0.9: _ConstModel(base),
+                  core.P90_CORR_KEY: 0.5}
+        with mock.patch.object(core, "load_model", return_value=bundle):
+            out = core.predict("implement a thing", "")
+        # p90 must reflect the additive log-space correction, lifting it above p50.
+        self.assertEqual(out["predicted_tokens"], int(math.expm1(base)))
+        self.assertEqual(out["predicted_p90"], int(math.expm1(base + 0.5)))
+        self.assertGreater(out["predicted_p90"], out["predicted_tokens"])
+
+
 class TestMidTaskModel(unittest.TestCase):
     def test_midtask_vector_length(self):
         pf = core.extract_prompt_features("implement a thing")

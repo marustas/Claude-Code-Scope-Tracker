@@ -52,17 +52,6 @@ def _tasks_with_checkpoints():
     return out
 
 
-def _fit(X, y):
-    from sklearn.ensemble import GradientBoostingRegressor
-    ylog = [math.log1p(v) for v in y]
-    models = {}
-    for q in core.QUANTILES:
-        m = GradientBoostingRegressor(loss="quantile", alpha=q, n_estimators=200,
-                                      max_depth=3, learning_rate=0.05, random_state=42)
-        m.fit(X, ylog)
-        models[q] = m
-    return models
-
 
 def _first_checkpoint(ck):
     for tools, tokens, counts in ck:
@@ -81,24 +70,26 @@ def evaluate(tasks, folds=5, seeds=(0, 1, 2, 3, 4)):
               f"tool calls — eval skipped)")
         return
 
-    w2_runs, cov_runs = [], []
+    w2_runs, nom_runs, cal_runs = [], [], []
     for seed in seeds:
         pool = eligible[:]
         random.Random(seed).shuffle(pool)
         buckets = [pool[i::folds] for i in range(folds)]
-        within2x = p90_cov = evaluated = 0
+        within2x = nom_cov = cal_cov = evaluated = 0
         for f in range(folds):
             test = buckets[f]
             train = [t for i, b in enumerate(buckets) if i != f for t in b]
-            X, y = [], []
-            for pf, rf, final, ck in train:
+            X, y, groups = [], [], []
+            for gi, (pf, rf, final, ck) in enumerate(train):
                 for tools, tokens, counts in ck:
                     if tools >= core.MIDTASK_MIN_TOOL_CALLS:
                         X.append(core.midtask_vector(pf, rf, tools, tokens, counts))
                         y.append(final)
+                        groups.append(gi)
             if len(X) < core.MIN_MIDTASK_ROWS:
                 continue
-            models = _fit(X, y)
+            models = core._fit_quantile_bundle(X, y, groups=groups)
+            corr = float(models.get(core.P90_CORR_KEY, 0.0))
             for pf, rf, final, ck in test:
                 cp = _first_checkpoint(ck)
                 if not cp:
@@ -106,27 +97,34 @@ def evaluate(tasks, folds=5, seeds=(0, 1, 2, 3, 4)):
                 tools, tokens, counts = cp
                 vec = core.midtask_vector(pf, rf, tools, tokens, counts)
                 p50 = max(tokens, math.expm1(float(models[0.5].predict([vec])[0])))
-                p90 = max(p50, math.expm1(float(models[0.9].predict([vec])[0])))
+                p90_log = float(models[0.9].predict([vec])[0])
+                nom = max(p50, math.expm1(p90_log))             # nominal p90
+                cal = max(p50, math.expm1(p90_log + corr))      # conformal-calibrated
                 if final and 0.5 <= p50 / final <= 2.0:
                     within2x += 1
-                if final <= p90:
-                    p90_cov += 1
+                if final <= nom:
+                    nom_cov += 1
+                if final <= cal:
+                    cal_cov += 1
                 evaluated += 1
         if evaluated:
             w2_runs.append(within2x / evaluated * 100)
-            cov_runs.append(p90_cov / evaluated * 100)
+            nom_runs.append(nom_cov / evaluated * 100)
+            cal_runs.append(cal_cov / evaluated * 100)
     if w2_runs:
         print(f"  mid-task (at first ≥{core.MIDTASK_MIN_TOOL_CALLS} tool calls, "
-              f"avg of {len(w2_runs)} seeds): "
-              f"within-2x = {statistics.mean(w2_runs):.0f}%   "
-              f"p90 coverage = {statistics.mean(cov_runs):.0f}%   (n={len(eligible)})")
-        print(f"  submit-time baseline was ~41% within-2x")
+              f"avg of {len(w2_runs)} seeds, n={len(eligible)}):")
+        print(f"    within-2x (p50)          = {statistics.mean(w2_runs):.0f}%  "
+              f"(submit-time baseline ~41%)")
+        print(f"    p90 coverage, nominal    = {statistics.mean(nom_runs):.0f}%")
+        print(f"    p90 coverage, conformal  = {statistics.mean(cal_runs):.0f}%  "
+              f"(target ≥90%)")
 
 
 def main():
     tasks = _tasks_with_checkpoints()
     print(f"replayed {len(tasks)} tasks")
-    X, y = core._midtask_training_rows()
+    X, y, _ = core._midtask_training_rows()
     print(f"training checkpoints (tool_calls >= {core.MIDTASK_MIN_TOOL_CALLS}): {len(X)}")
     if len(X) < core.MIN_MIDTASK_ROWS:
         print(f"not enough rows (need {core.MIN_MIDTASK_ROWS}) — model not trained")
