@@ -127,6 +127,37 @@ class TestLogSpaceQuantileModel(unittest.TestCase):
         self.assertGreaterEqual(out["predicted_p90"], out["predicted_tokens"])
 
 
+class TestTokenTiers(unittest.TestCase):
+    def test_tier_boundaries(self):
+        self.assertEqual(core.tier_of(0), "XS")
+        self.assertEqual(core.tier_of(4_999), "XS")
+        self.assertEqual(core.tier_of(5_000), "S")
+        self.assertEqual(core.tier_of(19_999), "S")
+        self.assertEqual(core.tier_of(20_000), "M")
+        self.assertEqual(core.tier_of(74_999), "M")
+        self.assertEqual(core.tier_of(75_000), "L")
+        self.assertEqual(core.tier_of(199_999), "L")
+        self.assertEqual(core.tier_of(200_000), "XL")
+        self.assertEqual(core.tier_of(5_000_000), "XL")
+
+    def test_tiers_cover_all_names_contiguously(self):
+        # Every tier's upper bound is the next tier's lower bound (no gaps/overlaps).
+        for (_, _, hi), (_, lo, _) in zip(core.TIERS, core.TIERS[1:]):
+            self.assertEqual(hi, lo)
+        self.assertEqual(core.TIER_NAMES, ("XS", "S", "M", "L", "XL"))
+
+    def test_predict_includes_tier(self):
+        from unittest import mock
+        bundle = {0.5: _ConstModel(math.log1p(90_000)),  # -> L
+                  0.9: _ConstModel(math.log1p(250_000)),  # -> XL
+                  core.P90_CORR_KEY: 0.0}
+        with mock.patch.object(core, "load_model", return_value=bundle):
+            out = core.predict("implement a thing", "")
+        self.assertEqual(out["tier"], core.tier_of(out["predicted_tokens"]))
+        self.assertEqual(out["tier"], "L")
+        self.assertEqual(out["tier_p90"], "XL")
+
+
 class TestConformalCalibration(unittest.TestCase):
     def test_small_data_skips_correction(self):
         try:
