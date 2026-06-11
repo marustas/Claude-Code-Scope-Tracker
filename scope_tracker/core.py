@@ -494,7 +494,11 @@ def load_model() -> Any | None:
     try:
         with open(MODEL_PATH, "rb") as f:
             return pickle.load(f)
-    except (pickle.PickleError, OSError, EOFError):
+    except Exception:  # noqa: BLE001 — incl. sklearn version-mismatch unpickle errors
+        # A model pickled by a different sklearn raises AttributeError/ImportError,
+        # not a PickleError. Treat any unreadable model as "no model" so prediction
+        # degrades silently instead of crashing the hook. A Stop-hook retrain
+        # regenerates a model compatible with the running interpreter.
         return None
 
 
@@ -778,7 +782,7 @@ def load_midtask_model() -> Any | None:
     try:
         with open(MIDTASK_MODEL_PATH, "rb") as f:
             return pickle.load(f)
-    except (pickle.PickleError, OSError, EOFError):
+    except Exception:  # noqa: BLE001 — incl. sklearn version-mismatch unpickle errors
         return None
 
 

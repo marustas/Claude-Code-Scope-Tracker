@@ -86,7 +86,13 @@ def on_prompt_submit() -> int:
     pf = core.extract_prompt_features(prompt)
     rf = core.extract_repo_features(cwd)
 
-    pred = core.predict(prompt, cwd)
+    # Prediction is best-effort and MUST NOT block logging. A broken/unreadable
+    # model (e.g. sklearn version mismatch) leaves pred=None; the task is still
+    # recorded so observability and future retraining keep working.
+    try:
+        pred = core.predict(prompt, cwd)
+    except Exception:  # noqa: BLE001
+        pred = None
     predicted_tokens = pred["predicted_tokens"] if pred else None
     predicted_p90 = pred["predicted_p90"] if pred else None
 
@@ -266,12 +272,16 @@ def on_stop() -> int:
     ).fetchone()[0]
     conn.close()
 
-    # Retrain on milestones, then every 25 tasks. Cheap with our small models.
+    # Retrain on milestones, every 25 tasks, OR whenever a model is missing or
+    # can't be loaded (e.g. an sklearn version change left an unreadable pickle —
+    # retraining here regenerates one compatible with the running interpreter).
     if completed_count >= core.MIN_TASKS_FOR_PREDICTION:
-        if completed_count in (20, 30, 50) or completed_count % 25 == 0:
+        milestone = completed_count in (20, 30, 50) or completed_count % 25 == 0
+        if milestone or core.load_model() is None:
             model = core.train_model()
             if model is not None:
                 core.save_model(model)
+        if milestone or core.load_midtask_model() is None:
             midtask = core.train_midtask_model()
             if midtask is not None:
                 core.save_midtask_model(midtask)
