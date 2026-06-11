@@ -337,6 +337,37 @@ def session_window_usage(at_time: float | None = None,
     }
 
 
+# --- Token tiers ("token poker") ---
+#
+# Exact counts aren't predictable from cheap signals, but the coarse *tier* is —
+# especially mid-task (measured ~49% exact / ~92% within-one-tier, vs ~39% for a
+# always-Medium baseline). Tiers also frame the estimate honestly: a relative size
+# (like story points) rather than a false-precision number.
+TIERS: tuple[tuple[str, int, float], ...] = (
+    ("XS", 0,        5_000),
+    ("S",  5_000,    20_000),
+    ("M",  20_000,   75_000),
+    ("L",  75_000,   200_000),
+    ("XL", 200_000,  math.inf),
+)
+TIER_NAMES = tuple(name for name, _, _ in TIERS)
+
+
+def tier_of(tokens: float) -> str:
+    """Map a token count to its size tier (XS/S/M/L/XL)."""
+    for name, lo, hi in TIERS:
+        if lo <= tokens < hi:
+            return name
+    return TIERS[-1][0]
+
+
+def tier_range(name: str) -> tuple[int, float]:
+    for n, lo, hi in TIERS:
+        if n == name:
+            return lo, hi
+    return 0, math.inf
+
+
 # --- Model ---
 
 def _load_training_data() -> tuple[list[list[float]], list[float]]:
@@ -509,6 +540,8 @@ def predict(prompt: str, cwd: str) -> dict[str, Any] | None:
     return {
         "predicted_tokens": p50,
         "predicted_p90": p90,
+        "tier": tier_of(p50),
+        "tier_p90": tier_of(p90),
         "stats": historical_stats(),
         "prompt_features": pf,
         "repo_features": rf,
@@ -777,5 +810,7 @@ def predict_midtask(pf: dict, rf: dict, tools_so_far: int, tokens_so_far: float,
     return {
         "predicted_tokens": p50,
         "predicted_p90": p90,
+        "tier": tier_of(p50),
+        "tier_p90": tier_of(p90),
         "stats": historical_stats(),
     }

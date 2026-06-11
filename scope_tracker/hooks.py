@@ -142,17 +142,17 @@ def on_prompt_submit() -> int:
     return 0
 
 
-def _format_midtask_warning(tokens_so_far: int, projected: int,
-                            projected_p90: int, tools: int, stats: dict) -> str:
+def _format_midtask_warning(tokens_so_far: int, projected: int, projected_p90: int,
+                            tier: str, tools: int, stats: dict) -> str:
     return (
-        f"[scope-tracker — mid-task notice for the user]: this task has already used "
-        f"~{tokens_so_far:,} tokens across {tools} tool calls and is now projected to "
-        f"finish around ~{projected:,} tokens, up to ~{projected_p90:,} (90th percentile) "
-        f"— above your usual range (mean {stats['mean']:,}). Tasks like this sometimes "
-        f"hit context limits before completing. Consider wrapping up the current step, "
-        f"committing partial progress, or narrowing the remaining work. (This is from a "
-        f"local hook, not from Claude. Mention it briefly to the user and offer to scope "
-        f"down the rest, then continue.)"
+        f"[scope-tracker — mid-task notice for the user]: this is shaping up as a "
+        f"{tier}-size task. It has already used ~{tokens_so_far:,} tokens across {tools} "
+        f"tool calls and is now projected to finish around ~{projected:,} tokens, up to "
+        f"~{projected_p90:,} (90th percentile) — above your usual range (mean "
+        f"{stats['mean']:,}). Tasks like this sometimes hit context limits before "
+        f"completing. Consider wrapping up the current step, committing partial progress, "
+        f"or narrowing the remaining work. (This is from a local hook, not from Claude. "
+        f"Mention it briefly to the user and offer to scope down the rest, then continue.)"
     )
 
 
@@ -198,7 +198,7 @@ def on_tool_use() -> int:
                     if proj["predicted_p90"] > threshold:
                         warn = _format_midtask_warning(
                             tokens_so_far, proj["predicted_tokens"],
-                            proj["predicted_p90"], tool_calls, stats)
+                            proj["predicted_p90"], proj["tier"], tool_calls, stats)
                         print(json.dumps({"hookSpecificOutput": {
                             "hookEventName": "PostToolUse",
                             "additionalContext": warn,
